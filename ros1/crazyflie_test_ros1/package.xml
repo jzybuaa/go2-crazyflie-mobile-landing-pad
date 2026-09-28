@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>crazyflie_test_ros1</name>
+  <version>0.1.0</version>
+  <description>ROS1 Crazyswarm1 dog-platform tracking controller for cf17.</description>
+
+  <maintainer email="jzybuaa@users.noreply.github.com">jzybuaa</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>geometry_msgs</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>crazyswarm</exec_depend>
+  <exec_depend>rospkg</exec_depend>
+
+  <export/>
+</package>

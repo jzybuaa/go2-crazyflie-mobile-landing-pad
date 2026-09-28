@@ -1,0 +1,9 @@
+bool arm
+---
+bool success
+uint16 supervisor_info
+bool can_arm
+bool is_armed
+bool can_fly
+bool is_flying
+string message

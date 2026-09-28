@@ -1,0 +1,863 @@
+diff --git a/ros_ws/src/crazyswarm/CMakeLists.txt b/ros_ws/src/crazyswarm/CMakeLists.txt
+index e35d2a9..2f0074a 100644
+--- a/ros_ws/src/crazyswarm/CMakeLists.txt
++++ b/ros_ws/src/crazyswarm/CMakeLists.txt
+@@ -59,6 +59,7 @@ find_package(PCL REQUIRED)
+ ## Generate services in the 'srv' folder
+ add_service_files(
+   FILES
++  Arm.srv
+   GoTo.srv
+   Land.srv
+   NotifySetpointsStop.srv
+diff --git a/ros_ws/src/crazyswarm/scripts/pycrazyswarm/crazyflie.py b/ros_ws/src/crazyswarm/scripts/pycrazyswarm/crazyflie.py
+index d065f52..c38ac5e 100644
+--- a/ros_ws/src/crazyswarm/scripts/pycrazyswarm/crazyflie.py
++++ b/ros_ws/src/crazyswarm/scripts/pycrazyswarm/crazyflie.py
+@@ -6,6 +6,7 @@ import yaml
+ import rospy
+ import numpy as np
+ import time
++import threading
+ import tf_conversions
+ from std_srvs.srv import Empty
+ import std_msgs
+@@ -84,6 +85,8 @@ class Crazyflie:
+         self.setGroupMaskService = rospy.ServiceProxy(prefix + "/set_group_mask", SetGroupMask)
+         rospy.wait_for_service(prefix + "/takeoff")
+         self.takeoffService = rospy.ServiceProxy(prefix + "/takeoff", Takeoff)
++        rospy.wait_for_service(prefix + "/arm")
++        self.armService = rospy.ServiceProxy(prefix + "/arm", Arm)
+         rospy.wait_for_service(prefix + "/land")
+         self.landService = rospy.ServiceProxy(prefix + "/land", Land)
+         # rospy.wait_for_service(prefix + "/stop")
+@@ -118,6 +121,46 @@ class Crazyflie:
+         self.cmdVelocityWorldMsg.header.seq = 0
+         self.cmdVelocityWorldMsg.header.frame_id = "/world"
+ 
++        self._supervisorLock = threading.Lock()
++        self._supervisorInfo = None
++        self._supervisorReceivedMonotonic = None
++        self._supervisorSubscriber = rospy.Subscriber(
++            prefix + "/supervisor_info",
++            std_msgs.msg.UInt16,
++            self._supervisorInfoCallback,
++            queue_size=10,
++        )
++
++    def _supervisorInfoCallback(self, msg):
++        with self._supervisorLock:
++            self._supervisorInfo = int(msg.data)
++            self._supervisorReceivedMonotonic = time.monotonic()
++
++    def supervisorState(self, maxAge=0.55):
++        """Return decoded, fresh supervisor.info, or None when unavailable."""
++        with self._supervisorLock:
++            if self._supervisorInfo is None or self._supervisorReceivedMonotonic is None:
++                return None
++            age = time.monotonic() - self._supervisorReceivedMonotonic
++            if age > maxAge:
++                return None
++            info = self._supervisorInfo
++        return {
++            "info": info,
++            "age": age,
++            "canArm": bool(info & (1 << 0)),
++            "isArmed": bool(info & (1 << 1)),
++            "autoArm": bool(info & (1 << 2)),
++            "canFly": bool(info & (1 << 3)),
++            "isFlying": bool(info & (1 << 4)),
++            "isTumbled": bool(info & (1 << 5)),
++            "isLocked": bool(info & (1 << 6)),
++        }
++
++    def requestArm(self, arm):
++        """Request arm/disarm; server success requires supervisor confirmation."""
++        return self.armService(bool(arm))
++
+     def setGroupMask(self, groupMask):
+         """Sets the group mask bits for this robot.
+ 
+diff --git a/ros_ws/src/crazyswarm/src/crazyswarm_server.cpp b/ros_ws/src/crazyswarm/src/crazyswarm_server.cpp
+index 6172ec5..2fc3e4e 100644
+--- a/ros_ws/src/crazyswarm/src/crazyswarm_server.cpp
++++ b/ros_ws/src/crazyswarm/src/crazyswarm_server.cpp
+@@ -8,6 +8,7 @@
+ #include "crazyswarm/UpdateParams.h"
+ #include "crazyswarm/UploadTrajectory.h"
+ #include "crazyswarm/NotifySetpointsStop.h"
++#include "crazyswarm/Arm.h"
+ #undef major
+ #undef minor
+ #include "crazyswarm/Hover.h"
+@@ -26,12 +27,14 @@
+ #include "sensor_msgs/Temperature.h"
+ #include "sensor_msgs/MagneticField.h"
+ #include "std_msgs/Float32.h"
++#include "std_msgs/UInt16.h"
+ 
+ #include <sensor_msgs/Joy.h>
+ #include <sensor_msgs/PointCloud.h>
+ 
+ //#include <regex>
+ #include <thread>
++#include <atomic>
+ #include <mutex>
+ #include <condition_variable>
+ 
+@@ -113,6 +116,22 @@ static ROSLogger rosLogger;
+ 
+ class CrazyflieROS
+ {
++private:
++  enum class ArmTransactionState {
++    Idle,
++    ArmQueued,
++    ArmTransport,
++    AwaitArmConfirmation,
++    ConfirmedArmed,
++    DisarmQueued,
++    DisarmTransport,
++    AwaitDisarmConfirmation,
++    RollbackQueued,
++    RollbackTransport,
++    AwaitRollbackConfirmation,
++    SafetyLatched,
++  };
++
+ public:
+   CrazyflieROS(
+     const std::string& link_uri,
+@@ -136,12 +155,29 @@ public:
+     , m_serviceUploadTrajectory()
+     , m_serviceStartTrajectory()
+     , m_serviceTakeoff()
++    , m_serviceArm()
+     , m_serviceLand()
+     , m_serviceGoTo()
+     , m_serviceSetGroupMask()
+     , m_serviceNotifySetpointsStop()
+     , m_logBlocks(log_blocks)
+     , m_initializedPosition(false)
++    , m_supervisorInfo(0)
++    , m_supervisorInfoValid(false)
++    , m_protocolVersion(-1)
++    , m_stopArmThread(false)
++    , m_shuttingDown(false)
++    , m_nextArmToken(0)
++    , m_armTransactionState(ArmTransactionState::Idle)
++    , m_serviceRequestActive(false)
++    , m_flyingSeenDuringTransaction(false)
++    , m_commandPending(false)
++    , m_commandDone(false)
++    , m_commandToken(0)
++    , m_commandSupervisorGenerationAtSend(0)
++    , m_commandArm(false)
++    , m_commandRollback(false)
++    , m_commandTransportSuccess(false)
+   {
+     ros::NodeHandle nl("~");
+     nl.param("enable_logging", m_enableLogging, false);
+@@ -164,6 +200,21 @@ public:
+     m_subscribeCmdFullState = n.subscribe(tf_prefix + "/cmd_full_state", 1, &CrazyflieROS::cmdFullStateSetpoint, this);
+     m_subscribeCmdVelocityWorld = n.subscribe(tf_prefix + "/cmd_velocity_world", 1, &CrazyflieROS::cmdVelocityWorldSetpoint, this);
+     m_subscribeCmdStop = n.subscribe(m_tf_prefix + "/cmd_stop", 1, &CrazyflieROS::cmdStop, this);
++    // Arm waits synchronously for a supervisor.info transition. It must not
++    // run on m_slowQueue: that queue's owner also sends the radio pings that
++    // deliver log callbacks. A dedicated ROS callback thread lets runSlow()
++    // continue polling the radio and invoke onSupervisorInfo().
++    ros::NodeHandle nArm;
++    nArm.setCallbackQueue(&m_armQueue);
++    m_serviceArm = nArm.advertiseService(
++      tf_prefix + "/arm", &CrazyflieROS::arm, this);
++    for (size_t i = 0; i < 2; ++i) {
++      m_armThreads.emplace_back([this]() {
++        while (ros::ok() && !m_stopArmThread.load()) {
++          m_armQueue.callOne(ros::WallDuration(0.05));
++        }
++      });
++    }
+ 
+     // New Velocity command type (Hover)
+     m_subscribeCmdHover=n.subscribe(m_tf_prefix+"/cmd_hover",1,&CrazyflieROS::cmdHoverSetpoint, this);
+@@ -189,6 +240,30 @@ public:
+ 
+   ~CrazyflieROS()
+   {
++    {
++      std::lock_guard<std::mutex> lock(m_supervisorMutex);
++      m_shuttingDown = true;
++      if (m_commandPending) {
++        auditLocked("shutdown cancels queued command", m_commandToken);
++        m_commandPending = false;
++        m_commandDone = true;
++        m_commandTransportSuccess = false;
++        m_commandError = "shutdown before radio send";
++      }
++      if (m_armTransactionState == ArmTransactionState::SafetyLatched ||
++          m_armTransactionState != ArmTransactionState::Idle) {
++        ROS_WARN("[%s] shutdown with arming state %s; physical armed state is not assumed",
++          m_frame.c_str(), armStateName(m_armTransactionState));
++      }
++    }
++    m_supervisorCv.notify_all();
++    m_stopArmThread.store(true);
++    m_armQueue.disable();
++    for (auto& thread : m_armThreads) {
++      if (thread.joinable()) {
++        thread.join();
++      }
++    }
+     m_logBlocks.clear();
+     m_logBlocksGeneric.clear();
+     // m_cf.trySysOff();
+@@ -208,9 +283,34 @@ public:
+   }
+ 
+   void sendPing() {
++    processArmingMailbox();
+     m_cf.sendPing();
+   }
+ 
++  bool requiresRadioPolling() const {
++    return m_enableLogging || static_cast<bool>(m_logBlockSupervisor);
++  }
++
++  bool takeoffAllowed(std::string& reason) {
++    std::lock_guard<std::mutex> lock(m_supervisorMutex);
++    if (m_protocolVersion != 9) {
++      return true;
++    }
++    if (m_armTransactionState != ArmTransactionState::ConfirmedArmed) {
++      reason = std::string("arming transaction state is ") +
++        armStateName(m_armTransactionState);
++    } else if (!supervisorFreshLocked()) {
++      reason = "supervisor.info unavailable or stale";
++    } else if (!isArmedLocked() || !canFlyLocked() || isFlyingLocked()) {
++      reason = "requires fresh isArmed=1, canFly=1, isFlying=0";
++    }
++    if (!reason.empty()) {
++      auditLocked(std::string("Takeoff rejected: ") + reason, m_commandToken);
++      return false;
++    }
++    return true;
++  }
++
+   // void joyChanged(
+   //       const sensor_msgs::Joy::ConstPtr& msg)
+   // {
+@@ -366,6 +466,10 @@ public:
+     crazyswarm::Takeoff::Request& req,
+     crazyswarm::Takeoff::Response& res)
+   {
++    std::string reason;
++    if (!takeoffAllowed(reason)) {
++      return false;
++    }
+     ROS_INFO("[%s] Takeoff", m_frame.c_str());
+ 
+     m_cf.takeoff(req.height, req.duration.toSec(), req.groupMask);
+@@ -373,6 +477,167 @@ public:
+     return true;
+   }
+ 
++  bool arm(
++    crazyswarm::Arm::Request& req,
++    crazyswarm::Arm::Response& res)
++  {
++    std::unique_lock<std::mutex> lock(m_supervisorMutex);
++    fillArmResponseLocked(res);
++    if (m_protocolVersion != 9) {
++      res.success = false;
++      res.message = "unsupported CRTP protocol (only protocol 9 legacy arming is implemented)";
++      return true;
++    }
++    if (m_shuttingDown) {
++      res.success = false;
++      res.message = "server is shutting down";
++      return true;
++    }
++    if (m_serviceRequestActive) {
++      res.success = false;
++      res.message = "another arming transaction is already active";
++      return true;
++    }
++    if (!supervisorFreshLocked()) {
++      res.success = false;
++      res.message = "supervisor.info unavailable or stale";
++      return true;
++    }
++    if (req.arm) {
++      if (isFlyingLocked()) {
++        res.success = false;
++        res.message = "arming rejected: isFlying=1";
++        return true;
++      }
++      if (isArmedLocked() && canFlyLocked()) {
++        m_armTransactionState = ArmTransactionState::ConfirmedArmed;
++        res.success = true;
++        res.message = "already armed and canFly confirmed";
++        return true;
++      }
++      if (!canArmLocked()) {
++        res.success = false;
++        res.message = "arming rejected: canArm=0";
++        return true;
++      }
++    } else {
++      if (isFlyingLocked()) {
++        res.success = false;
++        res.message = "disarming rejected: isFlying=1";
++        return true;
++      }
++      if (!isArmedLocked()) {
++        m_armTransactionState = ArmTransactionState::Idle;
++        res.success = true;
++        res.message = "already disarmed";
++        return true;
++      }
++    }
++
++    m_serviceRequestActive = true;
++    const uint64_t token = ++m_nextArmToken;
++    m_flyingSeenDuringTransaction = false;
++    enqueueArmingCommandLocked(
++      token,
++      req.arm,
++      false,
++      req.arm ? ArmTransactionState::ArmQueued
++              : ArmTransactionState::DisarmQueued);
++    auditLocked(req.arm ? "arm enqueued" : "disarm enqueued", token);
++    m_supervisorCv.notify_all();
++
++    const ros::WallTime transportDeadline =
++      ros::WallTime::now() + ros::WallDuration(COMMAND_TIMEOUT_S);
++    if (!waitForCommandLocked(lock, token, transportDeadline)) {
++      const std::string transportError = m_commandError.empty()
++        ? "transport result timeout" : m_commandError;
++      if (req.arm && !m_shuttingDown) {
++        return finishFailedArmWithRollbackLocked(
++          lock, token, res,
++          std::string("arm transport unconfirmed: ") + transportError);
++      }
++      setSafetyLatchedLocked(token, transportError);
++      fillArmResponseLocked(res);
++      res.success = false;
++      res.message = transportError;
++      m_serviceRequestActive = false;
++      return true;
++    }
++
++    if (!m_commandTransportSuccess) {
++      const std::string transportError = m_commandError.empty()
++        ? "arming transport failed" : m_commandError;
++      if (req.arm && !m_shuttingDown) {
++        return finishFailedArmWithRollbackLocked(
++          lock, token, res, transportError);
++      }
++      setSafetyLatchedLocked(token, transportError);
++      fillArmResponseLocked(res);
++      res.success = false;
++      res.message = transportError;
++      m_serviceRequestActive = false;
++      return true;
++    }
++
++    m_armTransactionState = req.arm
++      ? ArmTransactionState::AwaitArmConfirmation
++      : ArmTransactionState::AwaitDisarmConfirmation;
++    const uint64_t confirmationGeneration =
++      m_commandSupervisorGenerationAtSend;
++    auditLocked(req.arm ? "awaiting arm confirmation"
++                        : "awaiting disarm confirmation", token);
++    const ros::WallTime confirmDeadline =
++      ros::WallTime::now() + ros::WallDuration(CONFIRM_TIMEOUT_S);
++    while (!m_shuttingDown && ros::WallTime::now() < confirmDeadline) {
++      if (m_flyingSeenDuringTransaction || isFlyingLocked()) {
++        setSafetyLatchedLocked(token, "isFlying=1 observed during arming transaction");
++        fillArmResponseLocked(res);
++        res.success = false;
++        res.message = "SafetyLatched: isFlying=1; disarm/rollback prohibited";
++        m_serviceRequestActive = false;
++        return true;
++      }
++      if (m_supervisorGeneration > confirmationGeneration &&
++          supervisorFreshLocked()) {
++        if (req.arm && isArmedLocked() && canFlyLocked() && !isFlyingLocked()) {
++          m_armTransactionState = ArmTransactionState::ConfirmedArmed;
++          auditLocked("arm confirmed", token);
++          fillArmResponseLocked(res);
++          res.success = true;
++          res.message = "armed and canFly confirmed by fresh supervisor.info";
++          m_serviceRequestActive = false;
++          return true;
++        }
++        if (!req.arm && !isArmedLocked() && !isFlyingLocked()) {
++          m_armTransactionState = ArmTransactionState::Idle;
++          auditLocked("disarm confirmed", token);
++          fillArmResponseLocked(res);
++          res.success = true;
++          res.message = "disarmed confirmed by fresh supervisor.info";
++          m_serviceRequestActive = false;
++          return true;
++        }
++      }
++      m_supervisorCv.wait_for(lock, std::chrono::milliseconds(50));
++    }
++
++    if (req.arm && !m_shuttingDown) {
++      auditLocked("arm confirmation timeout; starting rollback", token);
++      return finishFailedArmWithRollbackLocked(
++        lock, token, res, "arm state confirmation timeout");
++    }
++    setSafetyLatchedLocked(token,
++      m_shuttingDown ? "shutdown while waiting for disarm"
++                     : "disarm state confirmation timeout");
++    fillArmResponseLocked(res);
++    res.success = false;
++    res.message = m_shuttingDown
++      ? "shutdown while waiting for disarm confirmation"
++      : "timeout waiting for disarm confirmation";
++    m_serviceRequestActive = false;
++    return true;
++  }
++
+   bool land(
+     crazyswarm::Land::Request& req,
+     crazyswarm::Land::Response& res)
+@@ -563,10 +828,40 @@ public:
+     std::chrono::duration<double> elapsedSeconds1 = end1-start;
+     ROS_INFO("[%s] reqParamTOC: %f s (%d params)", m_frame.c_str(), elapsedSeconds1.count(), numParams);
+ 
++    ROS_INFO("[%s] Requesting logging variables...", m_frame.c_str());
++    m_cf.requestLogToc(m_forceNoCache);
++    const int protocolVersion = m_cf.getProtocolVersion();
++    {
++      std::lock_guard<std::mutex> lock(m_supervisorMutex);
++      m_protocolVersion = protocolVersion;
++    }
++
++    if (protocolVersion == 9) {
++      ros::NodeHandle supervisorNode;
++      supervisorNode.setCallbackQueue(&queue);
++      m_pubSupervisorInfo = supervisorNode.advertise<std_msgs::UInt16>(
++        m_tf_prefix + "/supervisor_info", 10, true);
++
++      if (!m_cf.hasLogTocEntry("supervisor", "info") && !m_forceNoCache) {
++        ROS_WARN("[%s] supervisor.info missing from cached TOC; refreshing TOC",
++          m_frame.c_str());
++        m_cf.requestLogToc(true);
++      }
++      if (m_cf.hasLogTocEntry("supervisor", "info")) {
++        std::function<void(uint32_t, logSupervisorInfo*)> cb =
++          std::bind(&CrazyflieROS::onSupervisorInfo, this,
++            std::placeholders::_1, std::placeholders::_2);
++        m_logBlockSupervisor.reset(new LogBlock<logSupervisorInfo>(
++          &m_cf, {{"supervisor", "info"}}, cb));
++        m_logBlockSupervisor->start(10); // 100 ms, 10 Hz
++      } else {
++        ROS_WARN("[%s] supervisor.info unavailable; arming unsupported",
++          m_frame.c_str());
++      }
++    }
++
+     // Logging
+     if (m_enableLogging) {
+-      ROS_INFO("[%s] Requesting logging variables...", m_frame.c_str());
+-      m_cf.requestLogToc(m_forceNoCache);
+       auto end2 = std::chrono::system_clock::now();
+       std::chrono::duration<double> elapsedSeconds2 = end2-end1;
+       ROS_INFO("[%s] reqLogTOC: %f s", m_frame.c_str(), elapsedSeconds2.count());
+@@ -663,6 +958,258 @@ public:
+   }
+ 
+ private:
++  static constexpr double SUPERVISOR_MAX_AGE_S = 0.55;
++  static constexpr double COMMAND_TIMEOUT_S = 1.0;
++  static constexpr double CONFIRM_TIMEOUT_S = 1.5;
++  static constexpr double ROLLBACK_CONFIRM_TIMEOUT_S = 1.5;
++
++  static const char* armStateName(ArmTransactionState state) {
++    switch (state) {
++      case ArmTransactionState::Idle: return "Idle";
++      case ArmTransactionState::ArmQueued: return "ArmQueued";
++      case ArmTransactionState::ArmTransport: return "ArmTransport";
++      case ArmTransactionState::AwaitArmConfirmation: return "AwaitArmConfirmation";
++      case ArmTransactionState::ConfirmedArmed: return "ConfirmedArmed";
++      case ArmTransactionState::DisarmQueued: return "DisarmQueued";
++      case ArmTransactionState::DisarmTransport: return "DisarmTransport";
++      case ArmTransactionState::AwaitDisarmConfirmation: return "AwaitDisarmConfirmation";
++      case ArmTransactionState::RollbackQueued: return "RollbackQueued";
++      case ArmTransactionState::RollbackTransport: return "RollbackTransport";
++      case ArmTransactionState::AwaitRollbackConfirmation: return "AwaitRollbackConfirmation";
++      case ArmTransactionState::SafetyLatched: return "SafetyLatched";
++    }
++    return "Unknown";
++  }
++
++  static double monotonicSeconds() {
++    return std::chrono::duration<double>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
++  void auditLocked(const std::string& event, uint64_t token) const {
++    std::ostringstream threadId;
++    threadId << std::this_thread::get_id();
++    ROS_INFO("[%s] ARM-AUDIT token=%llu mono=%.6f thread=%s state=%s: %s",
++      m_frame.c_str(),
++      static_cast<unsigned long long>(token),
++      monotonicSeconds(),
++      threadId.str().c_str(),
++      armStateName(m_armTransactionState),
++      event.c_str());
++  }
++
++  bool supervisorFreshLocked() const {
++    return m_supervisorInfoValid &&
++      (ros::WallTime::now() - m_supervisorInfoWallTime).toSec()
++        <= SUPERVISOR_MAX_AGE_S;
++  }
++
++  bool canArmLocked() const { return (m_supervisorInfo & (1u << 0)) != 0; }
++  bool isArmedLocked() const { return (m_supervisorInfo & (1u << 1)) != 0; }
++  bool canFlyLocked() const { return (m_supervisorInfo & (1u << 3)) != 0; }
++  bool isFlyingLocked() const { return (m_supervisorInfo & (1u << 4)) != 0; }
++
++  void fillArmResponseLocked(crazyswarm::Arm::Response& res) const {
++    res.supervisor_info = m_supervisorInfo;
++    res.can_arm = canArmLocked();
++    res.is_armed = isArmedLocked();
++    res.can_fly = canFlyLocked();
++    res.is_flying = isFlyingLocked();
++  }
++
++  void enqueueArmingCommandLocked(
++    uint64_t token,
++    bool arm,
++    bool rollback,
++    ArmTransactionState queuedState)
++  {
++    if (m_commandPending) {
++      throw std::logic_error("arming mailbox already occupied");
++    }
++    m_commandPending = true;
++    m_commandDone = false;
++    m_commandToken = token;
++    m_commandArm = arm;
++    m_commandRollback = rollback;
++    m_commandTransportSuccess = false;
++    m_commandError.clear();
++    m_armTransactionState = queuedState;
++  }
++
++  bool waitForCommandLocked(
++    std::unique_lock<std::mutex>& lock,
++    uint64_t token,
++    const ros::WallTime& deadline)
++  {
++    while (!m_shuttingDown && ros::WallTime::now() < deadline) {
++      if (m_commandDone && m_commandToken == token) {
++        return true;
++      }
++      m_supervisorCv.wait_for(lock, std::chrono::milliseconds(50));
++    }
++    return m_commandDone && m_commandToken == token;
++  }
++
++  void setSafetyLatchedLocked(uint64_t token, const std::string& reason) {
++    m_armTransactionState = ArmTransactionState::SafetyLatched;
++    auditLocked(std::string("SafetyLatched: ") + reason, token);
++  }
++
++  bool finishFailedArmWithRollbackLocked(
++    std::unique_lock<std::mutex>& lock,
++    uint64_t token,
++    crazyswarm::Arm::Response& res,
++    const std::string& armFailure)
++  {
++    if (m_shuttingDown) {
++      setSafetyLatchedLocked(token, "shutdown before rollback");
++      fillArmResponseLocked(res);
++      res.success = false;
++      res.message = armFailure + "; shutdown prevented rollback";
++      m_serviceRequestActive = false;
++      return true;
++    }
++    if (m_flyingSeenDuringTransaction || isFlyingLocked()) {
++      setSafetyLatchedLocked(token, "isFlying=1; rollback prohibited");
++      fillArmResponseLocked(res);
++      res.success = false;
++      res.message = armFailure + "; SafetyLatched, rollback prohibited by isFlying=1";
++      m_serviceRequestActive = false;
++      return true;
++    }
++
++    enqueueArmingCommandLocked(
++      token, false, true, ArmTransactionState::RollbackQueued);
++    auditLocked("rollback disarm enqueued", token);
++    m_supervisorCv.notify_all();
++
++    const ros::WallTime transportDeadline =
++      ros::WallTime::now() + ros::WallDuration(COMMAND_TIMEOUT_S);
++    if (!waitForCommandLocked(lock, token, transportDeadline) ||
++        !m_commandTransportSuccess) {
++      const std::string error = m_commandError.empty()
++        ? "rollback transport timeout" : m_commandError;
++      setSafetyLatchedLocked(token, error);
++      fillArmResponseLocked(res);
++      res.success = false;
++      res.message = armFailure + "; rollback unconfirmed: " + error;
++      m_serviceRequestActive = false;
++      return true;
++    }
++
++    m_armTransactionState = ArmTransactionState::AwaitRollbackConfirmation;
++    const uint64_t rollbackGeneration =
++      m_commandSupervisorGenerationAtSend;
++    auditLocked("awaiting rollback confirmation", token);
++    const ros::WallTime confirmDeadline =
++      ros::WallTime::now() + ros::WallDuration(ROLLBACK_CONFIRM_TIMEOUT_S);
++    while (!m_shuttingDown && ros::WallTime::now() < confirmDeadline) {
++      if (m_flyingSeenDuringTransaction || isFlyingLocked()) {
++        setSafetyLatchedLocked(token, "isFlying=1 observed during rollback");
++        fillArmResponseLocked(res);
++        res.success = false;
++        res.message = armFailure + "; SafetyLatched, rollback not claimed";
++        m_serviceRequestActive = false;
++        return true;
++      }
++      if (m_supervisorGeneration > rollbackGeneration &&
++          supervisorFreshLocked() && !isArmedLocked() && !isFlyingLocked()) {
++        m_armTransactionState = ArmTransactionState::Idle;
++        auditLocked("rollback disarm confirmed", token);
++        fillArmResponseLocked(res);
++        res.success = false;
++        res.message = armFailure + "; rollback disarm confirmed";
++        m_serviceRequestActive = false;
++        return true;
++      }
++      m_supervisorCv.wait_for(lock, std::chrono::milliseconds(50));
++    }
++
++    setSafetyLatchedLocked(token,
++      m_shuttingDown ? "shutdown during rollback confirmation"
++                     : "rollback confirmation timeout");
++    fillArmResponseLocked(res);
++    res.success = false;
++    res.message = armFailure +
++      "; rollback was sent but not confirmed; SafetyLatched";
++    m_serviceRequestActive = false;
++    return true;
++  }
++
++  // Called only by CrazyflieGroup::runSlow() through sendPing(). This is the
++  // sole owner of Crazyflie radio sending and ACK/log processing for arming.
++  void processArmingMailbox() {
++    uint64_t token = 0;
++    bool arm = false;
++    bool rollback = false;
++    {
++      std::lock_guard<std::mutex> lock(m_supervisorMutex);
++      if (!m_commandPending) {
++        return;
++      }
++      token = m_commandToken;
++      arm = m_commandArm;
++      rollback = m_commandRollback;
++      if (m_shuttingDown || !ros::ok()) {
++        m_commandPending = false;
++        m_commandDone = true;
++        m_commandTransportSuccess = false;
++        m_commandError = "shutdown before radio send";
++        auditLocked("queued command cancelled at shutdown", token);
++        m_supervisorCv.notify_all();
++        return;
++      }
++      if (rollback && (m_flyingSeenDuringTransaction || isFlyingLocked())) {
++        m_commandPending = false;
++        m_commandDone = true;
++        m_commandTransportSuccess = false;
++        m_commandError = "rollback prohibited: isFlying=1";
++        setSafetyLatchedLocked(token, m_commandError);
++        m_supervisorCv.notify_all();
++        return;
++      }
++      m_commandPending = false;
++      m_commandSupervisorGenerationAtSend = m_supervisorGeneration;
++      m_armTransactionState = rollback
++        ? ArmTransactionState::RollbackTransport
++        : (arm ? ArmTransactionState::ArmTransport
++               : ArmTransactionState::DisarmTransport);
++      auditLocked(
++        rollback ? "radio dequeued rollback disarm"
++                 : (arm ? "radio dequeued arm" : "radio dequeued disarm"),
++        token);
++    }
++
++    bool transportSuccess = false;
++    std::string error;
++    try {
++      transportSuccess = m_cf.sendArmingRequest(arm);
++      if (!transportSuccess) {
++        error = "arming transport unsupported";
++      }
++    } catch (const std::exception& exc) {
++      error = std::string("arming transport failed: ") + exc.what();
++    }
++
++    {
++      std::lock_guard<std::mutex> lock(m_supervisorMutex);
++      if (m_commandToken != token) {
++        ROS_ERROR("[%s] discarded transport result for stale token=%llu",
++          m_frame.c_str(), static_cast<unsigned long long>(token));
++        return;
++      }
++      m_commandDone = true;
++      m_commandTransportSuccess = transportSuccess;
++      m_commandError = error;
++      auditLocked(
++        std::string("radio transport result=") +
++          (transportSuccess ? "ACK" : "failed") +
++          (error.empty() ? "" : " error=" + error),
++        token);
++    }
++    m_supervisorCv.notify_all();
++  }
++
+   struct logPose {
+     float x;
+     float y;
+@@ -670,6 +1217,10 @@ private:
+     int32_t quatCompressed;
+   } __attribute__((packed));
+ 
++  struct logSupervisorInfo {
++    uint16_t info;
++  } __attribute__((packed));
++
+ private:
+ 
+   void onLinkQuality(float linkQuality) {
+@@ -715,6 +1266,31 @@ private:
+     }
+   }
+ 
++  void onSupervisorInfo(uint32_t, logSupervisorInfo* data) {
++    {
++      std::lock_guard<std::mutex> lock(m_supervisorMutex);
++      const uint16_t previousInfo = m_supervisorInfo;
++      m_supervisorInfo = data->info;
++      m_supervisorInfoValid = true;
++      m_supervisorInfoWallTime = ros::WallTime::now();
++      ++m_supervisorGeneration;
++      if (m_serviceRequestActive && isFlyingLocked()) {
++        m_flyingSeenDuringTransaction = true;
++      }
++      if (previousInfo != m_supervisorInfo) {
++        std::ostringstream event;
++        event << "supervisor.info 0x" << std::hex << previousInfo
++              << " -> 0x" << m_supervisorInfo << std::dec
++              << " generation=" << m_supervisorGeneration;
++        auditLocked(event.str(), m_commandToken);
++      }
++    }
++    m_supervisorCv.notify_all();
++    std_msgs::UInt16 msg;
++    msg.data = data->info;
++    m_pubSupervisorInfo.publish(msg);
++  }
++
+   void onLogCustom(uint32_t time_in_ms, std::vector<double>* values, void* userData) {
+ 
+     ros::Publisher* pub = reinterpret_cast<ros::Publisher*>(userData);
+@@ -747,6 +1323,7 @@ private:
+   ros::ServiceServer m_serviceUploadTrajectory;
+   ros::ServiceServer m_serviceStartTrajectory;
+   ros::ServiceServer m_serviceTakeoff;
++  ros::ServiceServer m_serviceArm;
+   ros::ServiceServer m_serviceLand;
+   ros::ServiceServer m_serviceGoTo;
+   ros::ServiceServer m_serviceSetGroupMask;
+@@ -769,7 +1346,33 @@ private:
+   ros::Subscriber m_subscribeJoy;
+ 
+   ros::Publisher m_pubPose;
++  ros::Publisher m_pubSupervisorInfo;
+   std::unique_ptr<LogBlock<logPose>> m_logBlockPose;
++  std::unique_ptr<LogBlock<logSupervisorInfo>> m_logBlockSupervisor;
++
++  std::mutex m_supervisorMutex;
++  std::condition_variable m_supervisorCv;
++  uint16_t m_supervisorInfo;
++  bool m_supervisorInfoValid;
++  ros::WallTime m_supervisorInfoWallTime;
++  uint64_t m_supervisorGeneration = 0;
++  int m_protocolVersion;
++  ros::CallbackQueue m_armQueue;
++  std::vector<std::thread> m_armThreads;
++  std::atomic<bool> m_stopArmThread;
++  bool m_shuttingDown;
++  uint64_t m_nextArmToken;
++  ArmTransactionState m_armTransactionState;
++  bool m_serviceRequestActive;
++  bool m_flyingSeenDuringTransaction;
++  bool m_commandPending;
++  bool m_commandDone;
++  uint64_t m_commandToken;
++  uint64_t m_commandSupervisorGenerationAtSend;
++  bool m_commandArm;
++  bool m_commandRollback;
++  bool m_commandTransportSuccess;
++  std::string m_commandError;
+ 
+   std::ofstream m_logFile;
+   bool m_forceNoCache;
+@@ -957,13 +1560,9 @@ public:
+ 
+   void runSlow()
+   {
+-    ros::NodeHandle nl("~");
+-    bool enableLogging;
+-    nl.getParam("enable_logging", enableLogging);
+-
+     while(ros::ok() && !m_isEmergency) {
+-      if (enableLogging) {
+-        for (const auto& cf : m_cfs) {
++      for (const auto& cf : m_cfs) {
++        if (cf->requiresRadioPolling()) {
+           cf->sendPing();
+         }
+       }
+@@ -986,6 +1585,18 @@ public:
+     // }
+   }
+ 
++  bool takeoffAllowed(std::string& reason)
++  {
++    for (const auto& cf : m_cfs) {
++      std::string cfReason;
++      if (!cf->takeoffAllowed(cfReason)) {
++        reason = cf->frame() + ": " + cfReason;
++        return false;
++      }
++    }
++    return true;
++  }
++
+   void land(float height, float duration, uint8_t groupMask)
+   {
+     // for (size_t i = 0; i < 10; ++i) {
+@@ -1732,6 +2343,13 @@ private:
+     crazyswarm::Takeoff::Request& req,
+     crazyswarm::Takeoff::Response& res)
+   {
++    for (const auto& group : m_groups) {
++      std::string reason;
++      if (!group->takeoffAllowed(reason)) {
++        ROS_ERROR("Takeoff rejected before broadcast: %s", reason.c_str());
++        return false;
++      }
++    }
+     ROS_INFO("Takeoff!");
+ 
+     for (size_t i = 0; i < m_broadcastingNumRepeats; ++i) {

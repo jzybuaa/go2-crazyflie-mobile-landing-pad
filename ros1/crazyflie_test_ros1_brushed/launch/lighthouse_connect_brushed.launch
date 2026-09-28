@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="rviz" default="false"/>
+
+  <rosparam command="load" file="$(find crazyswarm)/launch/crazyflieTypes.yaml"/>
+  <rosparam command="load" file="$(find crazyflie_test_ros1_brushed)/config/crazyflies_brushed.yaml"/>
+
+  <node pkg="crazyswarm" type="crazyswarm_server"
+        name="crazyswarm_server" output="screen">
+    <rosparam>
+      firmwareParams:
+        commander:
+          enHighLevel: 1
+        stabilizer:
+          estimator: 2
+
+      motion_capture_type: "none"
+      object_tracking_type: "libobjecttracker"
+      send_position_only: False
+      motion_capture_host_name: "vicon"
+      save_point_clouds: "/dev/null"
+      print_latency: False
+      write_csvs: False
+      force_no_cache: False
+      enable_parameters: True
+      enable_logging: True
+      enable_logging_pose: True
+    </rosparam>
+  </node>
+
+  <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find crazyswarm)/launch/test.rviz"/>
+</launch>
