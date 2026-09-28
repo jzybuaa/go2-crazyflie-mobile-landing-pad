@@ -23,7 +23,7 @@ six_axis_platform/
 | Crazyflie 无刷控制 | ROS1 控制节点、launch、机群配置、离线自检入口 | ROS Noetic、Crazyswarm1、Crazyflie 与 Lighthouse 硬件；Arm/Supervisor 补丁需应用到指定 Crazyswarm1 版本 |
 | Crazyflie 有刷控制 | 独立 ROS1 控制节点、launch、机群配置、离线自检入口 | ROS Noetic、Crazyswarm1、旧版有刷 Crazyflie 固件及 Lighthouse；与无刷方案不能同时运行 |
 | 六自由度平台自稳 | PID、Stewart 逆运动学、串口协议、CSV 记录 | ESP32/传感器/舵机硬件和对应固件未包含；目前只能确认上位机代码，不能单独驱动完整平台 |
-| 无线充电 | 无 | 未找到充电控制、充电状态检测或充电通信程序；这里只记录平台与无人机控制软件 |
+| 无线充电 |Qi协议  | 发射端满足Qi协议即可 接收端采用开源方案 |
 
 两套 ROS1 包有完整的主要源文件、catkin 元数据、launch 和配置，脚本也提供离线自检入口。但这不等同于已在干净环境重新编译或完成真机验证。本次整理未改动飞行/自稳算法参数，也未运行飞行测试。
 
