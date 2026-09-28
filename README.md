@@ -1,4 +1,4 @@
-# Go2 移动停机坪与 Crazyflie 着陆实验
+# Go2 移动停机坪（适配 Crazyflie 有刷/无刷版）
 
 本仓库整理 Go2 背部六自由度并联平台与 Crazyflie 无人机协同实验的软件：Crazyflie ROS1 跟随/着陆控制、Crazyswarm1 Arm/Supervisor 接口补丁，以及平台姿态自稳上位机程序。
 
